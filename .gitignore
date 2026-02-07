@@ -1,0 +1,38 @@
+# Python
+# Byte-code files
+*.pyc
+__pycache__/
+
+# Distribution / packaging
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+*.tar.gz
+*.whl
+
+# Environments
+.env
+venv/
+env/
+ENV/
+
+# Editors and IDEs
+.vscode/        # VS Code
+.idea/          # PyCharm
+*.swp           # Vim
+
+# Miscellaneous
+# OS generated files
+.DS_Store       # macOS
+Thumbs.db       # Windows
+ehthumbs.db     # Windows
+
+# Test and coverage
+.coverage
+htmlcov/
+
+# Logs and data
+*.log
+local_data/
