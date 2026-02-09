@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package filetransfer;
+
+option go_package = "github.com/pedrofonseca/file-transfer-system/grpc-go-server/pb";
+
+// Chunk represents a single message in the upload stream.
+// The first message MUST contain metadata (filename + file_size).
+// All subsequent messages MUST contain raw file data.
+message Chunk {
+  oneof payload {
+    FileMetadata metadata = 1;
+    bytes        data     = 2;
+  }
+}
+
+// FileMetadata is sent as the first chunk to describe the incoming file.
+message FileMetadata {
+  string filename  = 1;
+  int64  file_size = 2;
+}
+
+// UploadStatus is returned after the entire stream has been consumed.
+message UploadStatus {
+  string filename       = 1;
+  int64  bytes_received = 2;
+  string message        = 3;
+}
+
+// FileTransfer service exposes a single client-streaming RPC.
+service FileTransfer {
+  // Upload receives a stream of Chunks and returns the final status.
+  rpc Upload(stream Chunk) returns (UploadStatus);
+}

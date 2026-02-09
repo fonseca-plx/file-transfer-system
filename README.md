@@ -1,223 +1,297 @@
 # File Transfer System
 
-Plataforma de transferência de arquivos em rede utilizando Sockets (TCP + UDP) e gRPC.
+Plataforma de transferência de arquivos em rede utilizando **gRPC** com streaming — servidor em **Go** e cliente em **Python**.
 
 ---
 
 ## Sobre o Projeto
 
-Este projeto é um estudo de caso acadêmico da disciplina de **Desenvolvimento de Sistemas Distribuídos** que implementa um sistema de **transferência de arquivos em rede com monitoramento de progresso em tempo real**.
+Este projeto é um estudo de caso acadêmico da disciplina de **Desenvolvimento de Sistemas Distribuídos** que implementa um sistema de **transferência de arquivos em rede** utilizando **gRPC com client-side streaming**.
 
 ### Objetivos
 
-- Demonstrar o uso direto de **sockets TCP e UDP** em Python, sem frameworks ou bibliotecas de alto nível
-- Separar os canais de comunicação: **TCP** para dados confiáveis e **UDP** para telemetria leve
-- Definir um **protocolo de aplicação customizado** sobre TCP e UDP
-- Permitir **concorrência** no servidor (múltiplos uploads simultâneos via threads)
+- Demonstrar comunicação baseada em **RPC** com contratos tipados (Protocol Buffers)
+- Utilizar **streaming gRPC** para transmissão eficiente de arquivos em chunks
+- Implementar **interoperabilidade entre linguagens** — servidor Go + cliente Python
+- Permitir comparação direta com a versão baseada em sockets
 
 ### Funcionalidades
 
-- Upload de arquivos de qualquer tipo e tamanho via TCP
-- Monitoramento de progresso em tempo real via UDP
-- Logging detalhado de toda a comunicação (`[TCP]`, `[UDP]`, `[SEND]`)
-- Suporte a múltiplos clientes simultâneos
-- Tolerância a falhas no canal UDP (perda de pacotes não interrompe a transferência)
+- Upload de arquivos de qualquer tipo e tamanho via gRPC streaming
+- Monitoramento de progresso em tempo real (logs no cliente e no servidor)
+- Logging detalhado de toda a comunicação (`[gRPC]`, `[SEND]`)
+- Contrato de serviço definido em Protocol Buffers (`.proto`)
+- Geração automática de stubs para Go e Python
 
 ---
 
 ## Arquitetura do Projeto
 
 ```
-sockets-python/
-├── server/                  # Lado do servidor
-│   ├── __main__.py          # Ponto de entrada — inicia TCP + UDP
-│   ├── tcp_server.py        # Servidor TCP — recebe e salva arquivos
-│   ├── udp_server.py        # Servidor UDP — recebe e exibe progresso
-│   ├── storage.py           # Escrita segura de arquivos em disco
-│   └── uploads/             # Diretório onde os arquivos são salvos
+.
+├── proto/                       # Definição do contrato gRPC
+│   └── file_transfer.proto      # Serviço, mensagens e tipos
 │
-├── client/                  # Lado do cliente
-│   ├── __main__.py          # Ponto de entrada — CLI do cliente
-│   ├── tcp_client.py        # Envia o arquivo por TCP em chunks
-│   ├── udp_progress.py      # Envia datagramas de progresso via UDP
-│   └── sender.py            # Orquestrador — conecta TCP + UDP
+├── grpc-go-server/              # Servidor (Go)
+│   ├── main.go                  # Ponto de entrada — implementa o serviço
+│   ├── go.mod / go.sum          # Dependências Go
+│   ├── pb/                      # Stubs gerados (protoc)
+│   │   ├── file_transfer.pb.go
+│   │   └── file_transfer_grpc.pb.go
+│   └── uploads/                 # Diretório onde os arquivos são salvos
 │
-└── shared/                  # Código compartilhado
-    └── protocol.py          # Protocolo de aplicação, constantes e helpers
+├── grpc-python-client/          # Cliente (Python)
+│   ├── client.py                # Ponto de entrada — CLI + upload streaming
+│   ├── requirements.txt         # Dependências Python (grpcio, grpcio-tools)
+│   └── pb/                      # Stubs gerados (grpc_tools.protoc)
+│       ├── file_transfer_pb2.py
+│       ├── file_transfer_pb2_grpc.py
+│       └── file_transfer_pb2.pyi
+│
+└── Makefile                     # Geração de stubs, build e execução
 ```
 
-**Por que essa separação?**
+**Responsabilidade de cada módulo:**
 
-| Módulo   | Responsabilidade |
-|----------|------------------|
-| `shared/` | Contrato entre cliente e servidor — formatos de mensagem, portas, tamanho de chunks. Qualquer mudança no protocolo é feita em um único lugar. |
-| `server/` | Recepção passiva — escuta conexões TCP e datagramas UDP. Cada responsabilidade (arquivo vs. progresso) fica em seu próprio módulo. |
-| `client/` | Envio ativo — lê o arquivo local, transmite por TCP e reporta progresso por UDP. O `sender.py` orquestra tudo. |
+| Módulo | Responsabilidade |
+|--------|------------------|
+| `proto/` | **Contrato compartilhado** — define as mensagens (`Chunk`, `FileMetadata`, `UploadStatus`) e o serviço (`FileTransfer`). Qualquer mudança na API é feita aqui e propagada via geração de stubs. |
+| `grpc-go-server/` | **Recepção** — escuta na porta `50051`, recebe o stream de chunks, extrai metadata, escreve o arquivo em `uploads/` e retorna o status. |
+| `grpc-python-client/` | **Envio** — lê o arquivo local em chunks de 4096 bytes, gera um iterador de mensagens `Chunk` e transmite via streaming gRPC. |
 
 ---
 
 ## Como Funciona
 
-### 1. Protocolo de Aplicação
+### 1. Contrato de Serviço (Protocol Buffers)
 
-O protocolo é definido em `shared/protocol.py` e usa dois canais independentes:
+O contrato é definido em `proto/file_transfer.proto`:
 
-#### Canal TCP (porta 5000) — Transferência de arquivo
+```protobuf
+service FileTransfer {
+  rpc Upload(stream Chunk) returns (UploadStatus);
+}
 
-As mensagens de controle (`HEADER` e `END`) são enviadas com **length-prefixed framing**: antes de cada mensagem, são enviados 4 bytes (big-endian) indicando o tamanho da mensagem. Isso permite ao receptor saber exatamente quantos bytes ler.
+message Chunk {
+  oneof payload {
+    FileMetadata metadata = 1;  // Primeiro chunk: nome e tamanho
+    bytes        data     = 2;  // Chunks seguintes: bytes do arquivo
+  }
+}
 
-| Etapa | Formato | Exemplo |
-|-------|---------|---------|
-| Início | `HEADER\|<nome_arquivo>\|<tamanho_bytes>\n` | `HEADER\|foto.jpg\|50000\n` |
-| Dados | Bytes brutos em pedaços de 4096 bytes | `[4096 bytes]` `[4096 bytes]` ... |
-| Fim | `END\n` | `END\n` |
+message FileMetadata {
+  string filename  = 1;
+  int64  file_size = 2;
+}
 
-#### Canal UDP (porta 5001) — Telemetria de progresso
+message UploadStatus {
+  string filename       = 1;
+  int64  bytes_received = 2;
+  string message        = 3;
+}
+```
 
-Cada datagrama é independente e autocontido:
-
-| Formato | Exemplo |
-|---------|---------|
-| `PROGRESS\|<nome_arquivo>\|<percentual>\n` | `PROGRESS\|foto.jpg\|41.0\n` |
+**Por que `oneof`?** Permite reutilizar a mesma mensagem `Chunk` tanto para metadata quanto para dados, evitando um RPC separado. O primeiro chunk do stream **sempre** carrega `FileMetadata`; todos os demais carregam `data`.
 
 ---
 
 ### 2. Fluxo Completo de uma Transferência
 
 ```
-        CLIENTE                                    SERVIDOR
+     CLIENTE (Python)                              SERVIDOR (Go)
            │                                          │
      ┌─────┴─────┐                             ┌──────┴──────┐
-     │ sender.py │                             │ __main__.py │
+     │ client.py │                             │   main.go   │
      └─────┬─────┘                             └──────┬──────┘
            │                                          │
-           │  ① TCP connect ──────────────────────►  :5000  (tcp_server.py)
+           │  ① gRPC connect ─────────────────────►  :50051
            │                                          │
-           │  ② HEADER|foto.jpg|50000 ────────────►   │  → decode_header()
-           │                                          │  → abre FileWriter
+           │  ② Chunk{metadata: {                     │
+           │       filename: "foto.jpg",              │
+           │       file_size: 51200                   │
+           │     }} ──────────────────────────────►   │  → abre arquivo em uploads/
            │                                          │
-           │  ③ [4096 bytes] ─────────────────────►   │  → writer.write_chunk()
-           │     [4096 bytes] ─────────────────────►  │  → writer.write_chunk()
-           │     [4096 bytes] ─────────────────────►  │  → writer.write_chunk()
-           │     [4096 bytes] ─────────────────────►  │  → writer.write_chunk()
-           │     [4096 bytes] ─────────────────────►  │  → writer.write_chunk()
+           │  ③ Chunk{data: [4096 bytes]} ────────►   │  → dst.Write(data)
+           │     Chunk{data: [4096 bytes]} ────────►  │  → dst.Write(data)
+           │     Chunk{data: [4096 bytes]} ────────►  │  → dst.Write(data)
+           │     Chunk{data: [4096 bytes]} ────────►  │  → dst.Write(data)
+           │     Chunk{data: [4096 bytes]} ────────►  │  → dst.Write(data)
            │                                          │
-           │  ④ UDP PROGRESS|foto.jpg|41.0 ·······►  :5001  (udp_server.py)
-           │     (a cada 5 chunks)                    │  → log de progresso
+           │     (cliente loga progresso a cada       │  (servidor loga progresso
+           │      5 chunks: [SEND] 40.0%)             │   a cada 5 chunks: [gRPC] 40.0%)
            │                                          │
-           │     ... continua chunks TCP ...          │
-           │     [últimos bytes] ─────────────────►   │
+           │     ... continua chunks ...              │
+           │     Chunk{data: [últimos bytes]} ─────►  │
            │                                          │
-           │  ⑤ UDP PROGRESS|foto.jpg|100.0 ······►  :5001
-           │     (sempre envia ao final)              │
+           │  ④ EOF (stream encerrado) ───────────►   │  → fecha arquivo
            │                                          │
-           │  ⑥ END ─────────────────────────────►    │  → fecha FileWriter
-           │                                          │  → arquivo salvo em uploads/
-           │  ⑦ TCP close ───────────────────────►    │
+           │  ⑤ UploadStatus {                        │
+           │       filename: "foto.jpg",              │
+           │       bytes_received: 51200,             │
+           │       message: "Upload succeeded"        │
+           │     } ◄──────────────────────────────    │
+           │                                          │
+           │  ⑥ Canal fechado                         │
            │                                          │
 ```
 
 #### Passo a passo detalhado:
 
-1. **Inicialização do servidor** (`python3 -m server`): o `__main__.py` cria uma **thread daemon** para o servidor UDP e roda o servidor TCP na **thread principal**. Ambos começam a escutar simultaneamente.
+1. **Conexão gRPC** (`①`): o cliente cria um canal inseguro (`grpc.insecure_channel`) para `localhost:50051` e obtém um stub do serviço `FileTransfer`.
 
-2. **Conexão TCP** (`①`): o cliente (`tcp_client.py`) cria um socket TCP e conecta em `localhost:5000`. O servidor aceita a conexão e cria uma **nova thread** dedicada para aquele cliente.
+2. **Envio de metadata** (`②`): o primeiro `Chunk` do stream carrega `FileMetadata` com o nome e tamanho do arquivo. O servidor extrai esses dados e cria o arquivo de destino em `uploads/`.
 
-3. **Envio do HEADER** (`②`): o cliente envia uma mensagem length-prefixed contendo `HEADER|nome_arquivo|tamanho`. O servidor decodifica e abre um `FileWriter` para o arquivo de destino em `server/uploads/`.
+3. **Streaming de dados** (`③`): o cliente usa um **generator Python** (`_chunk_iterator`) que lê o arquivo em pedaços de **4096 bytes** e faz `yield` de mensagens `Chunk(data=...)`. O gRPC cuida da serialização, framing e transporte. A cada 5 chunks, ambos os lados logam o progresso.
 
-4. **Envio dos chunks** (`③`): o cliente lê o arquivo local em pedaços de **4096 bytes** e os envia como bytes brutos pelo socket TCP. O servidor recebe e escreve cada pedaço diretamente em disco. O `tcp_client.py` usa um **generator** (`yield`) que retorna `(bytes_enviados, total)` a cada chunk.
+4. **Fim do stream** (`④`): quando o generator se esgota, o gRPC sinaliza EOF. O servidor fecha o arquivo em disco.
 
-5. **Progresso via UDP** (`④` e `⑤`): o `sender.py` consome o generator do TCP e, **a cada 5 chunks**, dispara um datagrama `PROGRESS|arquivo|percentual` via UDP na porta `5001`. O servidor UDP apenas loga a informação. Se o datagrama se perder, nada acontece — o upload continua normalmente.
+5. **Resposta** (`⑤`): o servidor chama `SendAndClose` com `UploadStatus` contendo o total de bytes recebidos e uma mensagem de confirmação.
 
-6. **Finalização** (`⑥` e `⑦`): após o último byte do arquivo, o cliente envia a mensagem `END` (length-prefixed). O servidor verifica o marcador, fecha o `FileWriter` e encerra a conexão TCP.
+6. **Encerramento** (`⑥`): o cliente lê a resposta, loga o resultado e fecha o canal.
 
 ---
 
-### 3. Responsabilidades: TCP vs UDP
+### 3. Comparação: gRPC vs Sockets
 
-| Aspecto | Servidor TCP (`:5000`) | Servidor UDP (`:5001`) |
-|---------|------------------------|------------------------|
-| **Protocolo** | TCP — confiável, ordenado, com conexão | UDP — sem conexão, sem garantia de entrega |
-| **Função** | Receber e salvar o arquivo em disco | Receber e exibir o progresso no log |
-| **Dados** | Bytes brutos do arquivo (críticos) | Texto leve: `PROGRESS\|arquivo\|%` (descartável) |
-| **Se falhar** | O upload falha — o arquivo fica corrompido | Nada acontece — o upload continua normalmente |
-| **Concorrência** | Uma thread por cliente conectado | Uma única thread daemon |
-| **Por que esse protocolo?** | Arquivos exigem entrega **confiável e ordenada** | Progresso é informação auxiliar — perda é aceitável |
+| Aspecto | Sockets (TCP + UDP) | gRPC |
+|---------|---------------------|------|
+| **Protocolo** | Customizado (`HEADER\|END`), framing manual | Protocol Buffers — tipado, versionável |
+| **Transporte** | TCP (arquivo) + UDP (progresso) — 2 portas | HTTP/2 multiplexado — 1 porta |
+| **Progresso** | Canal separado UDP, tolerante a perda | Logs locais em ambos os lados (mesmo stream) |
+| **Serialização** | Manual (`encode`/`decode`, `struct.pack`) | Automática (protobuf) |
+| **Linguagens** | Python-only | Go (servidor) + Python (cliente) — interoperável |
+| **Complexidade** | Alta — gerenciar sockets, threads, protocolo | Baixa — definir `.proto`, gerar stubs, implementar |
+| **Linhas de código** | ~250 (7 arquivos Python + shared) | ~150 (1 Go + 1 Python + 1 proto) |
+| **Confiabilidade** | TCP confiável, UDP não — lógica manual | gRPC sobre HTTP/2 — confiável por padrão |
+| **Streaming** | Generator manual sobre socket raw | `stream` nativo no contrato `.proto` |
+
+---
+
+## Pré-requisitos
+
+- **Go 1.18+**
+- **Python 3.10+**
+- **protoc** (Protocol Buffers compiler)
+- **protoc-gen-go** e **protoc-gen-go-grpc** (plugins Go para protoc)
+- **grpcio** e **grpcio-tools** (pacotes Python)
+
+### Instalação das dependências
+
+```bash
+# protoc e Go (Ubuntu/Debian)
+sudo apt install golang-go protobuf-compiler
+
+# Plugins Go para protoc
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+# Adicionar ao PATH (se necessário)
+export PATH="$PATH:$(go env GOPATH)/bin"
+
+# Setup completo (gera stubs + instala deps Python)
+make setup
+```
 
 ---
 
 ## Como Executar e Testar
 
-### Pré-requisitos
+### Passo 1 — Gerar stubs e instalar dependências
 
-- **Python 3.10+** (utiliza type union `X | None`)
-- Nenhuma dependência externa — apenas a biblioteca padrão do Python
+```bash
+make setup
+```
 
-### Passo 1 — Iniciar o servidor
+Isso executa:
+- `make proto-go` — gera stubs Go em `grpc-go-server/pb/`
+- `make proto-py` — gera stubs Python em `grpc-python-client/pb/`
+- `make go-deps` — baixa dependências Go
+- `make py-deps` — instala pacotes Python
+
+### Passo 2 — Iniciar o servidor Go
 
 Abra um terminal e execute:
 
 ```bash
-cd sockets-python/
-python3 -m server
+make run-server
 ```
 
 Saída esperada:
 
 ```
-2026-02-07 17:20:20,381 INFO     [MAIN] UDP thread started
-2026-02-07 17:20:20,382 INFO     [MAIN] Starting TCP server on main thread
-2026-02-07 17:20:20,382 INFO     [TCP] Server listening on localhost:5000
-2026-02-07 17:20:20,382 INFO     [UDP] Listening on localhost:5001
+2026/02/07 20:52:06 [gRPC] Server listening on :50051
 ```
 
-### Passo 2 — Enviar um arquivo
+### Passo 3 — Enviar um arquivo
 
 Em **outro terminal**, execute:
 
 ```bash
-cd sockets-python/
-python3 -m client caminho/do/arquivo.ext
+make run-client FILE=/caminho/do/arquivo.ext
 ```
 
 Exemplo com um arquivo de teste:
 
 ```bash
 # Criar um arquivo de teste de 50 KB
-head -c 50000 /dev/urandom > /tmp/testfile.bin
+head -c 51200 /dev/urandom > /tmp/testfile.bin
 
 # Enviar
-python3 -m client /tmp/testfile.bin
+make run-client FILE=/tmp/testfile.bin
 ```
 
 Saída esperada (cliente):
 
 ```
-2026-02-07 17:23:03,112 INFO     [TCP] Connected to localhost:5000
-2026-02-07 17:23:03,113 INFO     [TCP] Sent HEADER — file=testfile.bin size=50000
-2026-02-07 17:23:03,116 INFO     [SEND] testfile.bin — 41.0% (20480/50000 bytes)
-2026-02-07 17:23:03,117 INFO     [SEND] testfile.bin — 81.9% (40960/50000 bytes)
-2026-02-07 17:23:03,117 INFO     [SEND] testfile.bin — 100.0% (50000/50000 bytes)
-2026-02-07 17:23:03,117 INFO     [TCP] Sent END — upload finished
-2026-02-07 17:23:03,118 INFO     [SEND] Transfer complete: testfile.bin
+2026-02-07 20:52:26,360 INFO     [gRPC] Connecting to localhost:50051
+2026-02-07 20:52:26,401 INFO     [gRPC] Sending metadata — file=testfile.bin size=51200
+2026-02-07 20:52:26,403 INFO     [SEND] testfile.bin — 40.0% (20480/51200 bytes)
+2026-02-07 20:52:26,404 INFO     [SEND] testfile.bin — 80.0% (40960/51200 bytes)
+2026-02-07 20:52:26,405 INFO     [SEND] Finished streaming: testfile.bin — 51200 bytes in 13 chunks
+2026-02-07 20:52:26,406 INFO     [gRPC] Server response — file=testfile.bin bytes_received=51200 message='Upload of 'testfile.bin' succeeded'
+2026-02-07 20:52:26,407 INFO     [SEND] Transfer complete: testfile.bin
 ```
 
-O arquivo ficará salvo em `sockets-python/server/uploads/`.
+Saída esperada (servidor):
 
-### Passo 3 — Verificar integridade
+```
+2026/02/07 20:52:26 [gRPC] Receiving file: testfile.bin (51200 bytes)
+2026/02/07 20:52:26 [gRPC] testfile.bin — 40.0% (20480/51200 bytes)
+2026/02/07 20:52:26 [gRPC] testfile.bin — 80.0% (40960/51200 bytes)
+2026/02/07 20:52:26 [gRPC] Upload complete: testfile.bin — 51200 bytes received in 13 chunks
+```
+
+O arquivo ficará salvo em `grpc-go-server/uploads/`.
+
+### Passo 4 — Verificar integridade
 
 ```bash
 md5sum /tmp/testfile.bin
-md5sum sockets-python/server/uploads/testfile.bin
+md5sum grpc-go-server/uploads/testfile.bin
 ```
 
 Os hashes devem ser idênticos.
 
-### Testes de falha sugeridos
+### Testes sugeridos
 
 | Cenário | Como testar | Comportamento esperado |
 |---------|-------------|------------------------|
-| **Servidor UDP desligado** | Não iniciar o servidor, ou matar a thread | Upload TCP completa normalmente; logs de progresso mostram warnings |
+| **Servidor desligado** | Rodar o cliente sem o servidor | `RPC failed: StatusCode.UNAVAILABLE` — erro claro e imediato |
 | **Arquivo grande** | `head -c 100000000 /dev/urandom > /tmp/big.bin` (100 MB) | Upload funciona, progresso atualizado a cada 5 chunks |
-| **Cliente interrompido** | `Ctrl+C` durante o upload | Servidor detecta desconexão e loga erro; arquivo parcial pode existir |
-| **Múltiplos clientes** | Rodar dois clientes em terminais separados ao mesmo tempo | Servidor atende ambos em threads independentes |
+| **Cliente interrompido** | `Ctrl+C` durante o upload | Servidor detecta stream encerrado e loga erro |
+| **Arquivo inexistente** | `make run-client FILE=/nao/existe` | `[gRPC] File not found` — validação local antes do RPC |
+
+---
+
+## Comandos do Makefile
+
+| Comando | Descrição |
+|---------|-----------|
+| `make setup` | Gera todos os stubs + instala dependências |
+| `make proto-all` | Gera stubs Go e Python |
+| `make proto-go` | Gera apenas stubs Go |
+| `make proto-py` | Gera apenas stubs Python |
+| `make run-server` | Compila e inicia o servidor Go |
+| `make run-client FILE=...` | Envia um arquivo via o cliente Python |
+| `make go-build` | Apenas compila o servidor Go |
+| `make clean` | Remove stubs gerados e binários |
